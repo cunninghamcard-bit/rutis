@@ -44,31 +44,17 @@ jobs:
           for i in $(seq 1 "$ROUNDS"); do
             rm -f /tmp/rutis-kill-debug.log /tmp/rutis-kill-interpose.log
             echo "::group::round $i $(date '+%H:%M:%S')"
-            if ! DYLD_INSERT_LIBRARIES="$RUNNER_TEMP/kill-interpose.dylib" cargo test -p rutis-bridge --all-features $tests 2>&1 | tee "$RUNNER_TEMP/round-$i.log" | grep -E '^test result|FAILED|panicked|SIGKILL'; then :; fi
+            DYLD_INSERT_LIBRARIES="$RUNNER_TEMP/kill-interpose.dylib" cargo test -p rutis-bridge --all-features $tests > "$RUNNER_TEMP/round-$i.log" 2>&1
+            grep -E '^test result|FAILED|panicked|SIGKILL' "$RUNNER_TEMP/round-$i.log"
             echo "::endgroup::"
             if grep -q 'test result: FAILED' "$RUNNER_TEMP/round-$i.log"; then
               failed=$((failed + 1))
               echo "第 $i 轮失败（$(date '+%H:%M:%S')）："
-              grep -E -B1 -A3 'panicked at|signal: 9' "$RUNNER_TEMP/round-$i.log" | head -30
-              cp /tmp/rutis-kill-debug.log "$RUNNER_TEMP/kill-debug-round-$i.log" 2>/dev/null
+              grep -E -A1 'panicked at' "$RUNNER_TEMP/round-$i.log" | head -20
               cp /tmp/rutis-kill-interpose.log "$RUNNER_TEMP/kill-debug-interpose-round-$i.log" 2>/dev/null
+              cp /tmp/rutis-kill-debug.log "$RUNNER_TEMP/kill-debug-round-$i.log" 2>/dev/null
               echo "---- rpc_callbacks 进程发出的每一个 SIGKILL（系统调用层拦截）----"
-              rp=$(grep -o 'rpc_callbacks-[0-9a-f]*' "$RUNNER_TEMP/round-$i.log" | head -1)
-              python3 - "/tmp/rutis-kill-interpose.log" <<'PY'
-import sys, re
-text = open(sys.argv[1], errors="replace").read()
-for rec in text.split("==== ")[1:]:
-    lines = rec.splitlines()
-    if any("rpc_callbacks" in l for l in lines):
-        print("==== " + lines[0])
-        for l in lines[1:]:
-            if re.search(r"rutis|rpc_callbacks|tokio|std::process|kill", l):
-                print("   " + re.sub(r"\s+", " ", l.strip())[:220])
-PY
-              echo "---- rpc_callbacks 进程里出现过两次的 node 进程号（进程号复用）----"
-              awk '/^==== /{proc=$3; getline what; if (what ~ /SPAWNED/) { match(what, /Some\([0-9]+\)/); pid=substr(what, RSTART+5, RLENGTH-6); key=proc" "pid; if (seen[key]) print "REUSED", key, "first:", seen[key], "then:", what; else seen[key]=what } }' /tmp/rutis-kill-debug.log
-              echo "---- 本轮 rutis 发出的结束子进程记录（只保留 rutis / 测试相关的栈帧）----"
-              awk '/^==== /{print; next} /^runtime::|^transport::/{print "  " $0; next} /rutis_bridge::|rpc_callbacks/{print "      " $0}' /tmp/rutis-kill-debug.log | head -400
+              python3 tools/debug/kill-report.py /tmp/rutis-kill-interpose.log | head -300
             fi
           done
           echo "失败 $failed / $ROUNDS 轮"
