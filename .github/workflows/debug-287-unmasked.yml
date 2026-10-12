@@ -1,0 +1,75 @@
+# 临时：在自托管 macOS runner 上反复跑 rutis-bridge 的测试，抓 #287 的 SIGKILL。
+# 只在 debug/287-unmasked 分支上触发；查清后删掉这个分支。
+name: debug-287-unmasked
+on:
+  push:
+    branches: [debug/287-unmasked]
+  workflow_dispatch:
+    inputs:
+      rounds:
+        description: 轮数
+        default: '10'
+jobs:
+  repeat:
+    runs-on: [self-hosted, macOS, ARM64]
+    timeout-minutes: 120
+    env:
+      CARGO_TARGET_DIR: /Users/colab/.cache/rutis-debug/${{ github.run_id }}
+      ROUNDS: ${{ inputs.rounds || '10' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.98.1
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '26'
+      - run: npm --prefix node/rutis-runtime ci
+      - uses: astral-sh/setup-uv@v6
+      - run: |
+          uv venv --python 3 "$RUNNER_TEMP/venv"
+          echo "$RUNNER_TEMP/venv/bin" >> "$GITHUB_PATH"
+      - run: uv pip install --python "$RUNNER_TEMP/venv/bin/python" "websockets>=15"
+      - uses: oven-sh/setup-bun@v2
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: false
+      - name: build
+        run: cargo test -p rutis-bridge --all-features $(bash tools/platform-tests.sh crates/rutis-bridge link memory_mux memory_plugin memory_session multihop node node_conformance) --no-run
+      - name: c-repro
+        run: |
+          cc -o "$RUNNER_TEMP/287-sec" .github/287-sec.c -framework Security -framework CoreFoundation
+          "$RUNNER_TEMP/287-sec" race 200
+          "$RUNNER_TEMP/287-sec" pre 200
+      - name: fork-handlers-test
+        run: |
+          for i in 1 2 3 4 5; do
+            echo "== without settle $i"; RUTIS_287_NO_SETTLE=1 cargo test -p rutis-bridge --all-features --test fork_handlers 2>&1 | grep -E 'test result|round [0-9]+:|signal' | head -5
+            echo "== with settle $i"; cargo test -p rutis-bridge --all-features --test fork_handlers 2>&1 | grep -E 'test result|round [0-9]+:|signal' | head -5
+          done
+      - name: repeat
+        run: |
+          tests=$(bash tools/platform-tests.sh crates/rutis-bridge link memory_mux memory_plugin memory_session multihop node node_conformance)
+          failed=0
+          ulimit -n; ulimit -u; launchctl limit maxfiles; sw_vers; node --version
+          mkdir -p "$RUNNER_TEMP/failed"
+          for i in $(seq 1 "$ROUNDS"); do
+            echo "::group::round $i $(date '+%H:%M:%S')"
+            if ! cargo test -p rutis-bridge --all-features $tests 2>&1 | tee "$RUNNER_TEMP/round-$i.log" | grep -E '^test result|FAILED|panicked|SIGKILL'; then :; fi
+            echo "::endgroup::"
+            if grep -q 'test result: FAILED' "$RUNNER_TEMP/round-$i.log"; then
+              failed=$((failed + 1))
+              echo "第 $i 轮失败（$(date '+%H:%M:%S')）："
+              grep -E -B1 -A3 'panicked at|signal: 9' "$RUNNER_TEMP/round-$i.log" | head -30
+              cp "$RUNNER_TEMP/round-$i.log" "$RUNNER_TEMP/failed/"
+              grep -E 'T287 .*(KILL|RECV-END|SEND-FAIL|DROP-KILL)' "$RUNNER_TEMP/round-$i.log" | grep -v 'sig=0' | head -60
+            fi
+          done
+          echo "失败 $failed / $ROUNDS 轮"
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: failed-rounds
+          path: ${{ runner.temp }}/failed
+          if-no-files-found: ignore
+      - if: always()
+        run: rm -rf "$CARGO_TARGET_DIR"

@@ -213,7 +213,9 @@ pub(crate) fn hand_over(
     channel: Option<std::os::fd::RawFd>,
 ) {
     #[cfg(target_vendor = "apple")]
-    settle_fork_handlers();
+    if std::env::var_os("RUTIS_287_NO_SETTLE").is_none() {
+        settle_fork_handlers();
+    }
     let first = match channel {
         Some(_) => CHANNEL_FD + 1,
         None => CHANNEL_FD,

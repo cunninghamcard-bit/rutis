@@ -7,6 +7,55 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+/// DEBUG #287: every kill(2) and fork(2) of this test process, with the
+/// thread (= test name) and a backtrace for kills.
+#[cfg(target_os = "macos")]
+mod trace287 {
+    use std::io::Write;
+    fn now() -> String {
+        let t = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap();
+        format!("{}.{:06}", t.as_secs(), t.subsec_micros())
+    }
+    fn thread() -> String {
+        std::thread::current().name().unwrap_or("?").to_owned()
+    }
+    #[no_mangle]
+    pub unsafe extern "C" fn kill(pid: libc::pid_t, sig: libc::c_int) -> libc::c_int {
+        type Kill = unsafe extern "C" fn(libc::pid_t, libc::c_int) -> libc::c_int;
+        let real: Kill = std::mem::transmute(libc::dlsym(libc::RTLD_NEXT, c"kill".as_ptr()));
+        let result = real(pid, sig);
+        let errno = std::io::Error::last_os_error();
+        if sig != 0 {
+            let bt = std::backtrace::Backtrace::force_capture();
+            let _ = writeln!(
+                std::io::stderr(),
+                "T287 {} KILL pid={pid} sig={sig} result={result} errno={errno} thread={} self={}\n{bt}\nT287 END",
+                now(),
+                thread(),
+                std::process::id()
+            );
+        }
+        result
+    }
+    #[no_mangle]
+    pub unsafe extern "C" fn fork() -> libc::pid_t {
+        type Fork = unsafe extern "C" fn() -> libc::pid_t;
+        let real: Fork = std::mem::transmute(libc::dlsym(libc::RTLD_NEXT, c"fork".as_ptr()));
+        let pid = real();
+        if pid > 0 {
+            let _ = writeln!(
+                std::io::stderr(),
+                "T287 {} FORK child={pid} thread={}",
+                now(),
+                thread()
+            );
+        }
+        pid
+    }
+}
+
 async fn launch() -> (tempfile::NamedTempFile, Arc<Process>) {
     let mut plugin = tempfile::Builder::new().suffix(".mjs").tempfile().unwrap();
     plugin
