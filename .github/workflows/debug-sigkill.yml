@@ -44,8 +44,8 @@ jobs:
           for i in $(seq 1 "$ROUNDS"); do
             rm -f /tmp/rutis-kill-debug.log /tmp/rutis-kill-interpose.log
             echo "::group::round $i $(date '+%H:%M:%S')"
-            DYLD_INSERT_LIBRARIES="$RUNNER_TEMP/kill-interpose.dylib" cargo test -p rutis-bridge --all-features $tests > "$RUNNER_TEMP/round-$i.log" 2>&1
-            grep -E '^test result|FAILED|panicked|SIGKILL' "$RUNNER_TEMP/round-$i.log"
+            DYLD_INSERT_LIBRARIES="$RUNNER_TEMP/kill-interpose.dylib" cargo test -p rutis-bridge --all-features $tests > "$RUNNER_TEMP/round-$i.log" 2>&1 || true
+            grep -E '^test result|FAILED|panicked|SIGKILL' "$RUNNER_TEMP/round-$i.log" || true
             echo "::endgroup::"
             if grep -q 'test result: FAILED' "$RUNNER_TEMP/round-$i.log"; then
               failed=$((failed + 1))
