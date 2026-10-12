@@ -44,17 +44,18 @@ jobs:
           for i in $(seq 1 "$ROUNDS"); do
             rm -f /tmp/rutis-kill-debug.log /tmp/rutis-kill-interpose.log
             echo "::group::round $i $(date '+%H:%M:%S')"
-            DYLD_INSERT_LIBRARIES="$RUNNER_TEMP/kill-interpose.dylib" cargo test -p rutis-bridge --all-features $tests > "$RUNNER_TEMP/round-$i.log" 2>&1 || true
+            KILL_INTERPOSE="$RUNNER_TEMP/kill-interpose.dylib" CARGO_TARGET_AARCH64_APPLE_DARWIN_RUNNER="$PWD/tools/debug/with-interpose.sh" cargo test -p rutis-bridge --all-features $tests > "$RUNNER_TEMP/round-$i.log" 2>&1 || true
             grep -E '^test result|FAILED|panicked|SIGKILL' "$RUNNER_TEMP/round-$i.log" || true
+            echo "拦截到的 SIGKILL：$(grep -c '^==== ' /tmp/rutis-kill-interpose.log 2>/dev/null || echo 0) 次"
             echo "::endgroup::"
             if grep -q 'test result: FAILED' "$RUNNER_TEMP/round-$i.log"; then
               failed=$((failed + 1))
               echo "第 $i 轮失败（$(date '+%H:%M:%S')）："
               grep -E -A1 'panicked at' "$RUNNER_TEMP/round-$i.log" | head -20
-              cp /tmp/rutis-kill-interpose.log "$RUNNER_TEMP/kill-debug-interpose-round-$i.log" 2>/dev/null
-              cp /tmp/rutis-kill-debug.log "$RUNNER_TEMP/kill-debug-round-$i.log" 2>/dev/null
+              cp /tmp/rutis-kill-interpose.log "$RUNNER_TEMP/kill-debug-interpose-round-$i.log" 2>/dev/null || echo "（没有拦截日志）"
+              cp /tmp/rutis-kill-debug.log "$RUNNER_TEMP/kill-debug-round-$i.log" 2>/dev/null || true
               echo "---- rpc_callbacks 进程发出的每一个 SIGKILL（系统调用层拦截）----"
-              python3 tools/debug/kill-report.py /tmp/rutis-kill-interpose.log | head -300
+              python3 tools/debug/kill-report.py /tmp/rutis-kill-interpose.log | head -300 || true
             fi
           done
           echo "失败 $failed / $ROUNDS 轮"
