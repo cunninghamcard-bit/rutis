@@ -15,7 +15,7 @@ jobs:
     timeout-minutes: 120
     env:
       CARGO_TARGET_DIR: /Users/colab/.cache/rutis-debug/${{ github.run_id }}
-      ROUNDS: ${{ inputs.rounds || '10' }}
+      ROUNDS: ${{ inputs.rounds || '20' }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.98.1
