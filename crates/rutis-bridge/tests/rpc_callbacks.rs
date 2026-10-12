@@ -301,6 +301,7 @@ async fn node_sync_wait_pumps_callbacks_and_reports_its_executor_cycle() {
         .kill_on_drop(true)
         .spawn()
         .unwrap();
+        rutis_bridge::runtime::kill_debug(&format!("SPAWNED test-code node pid {:?} (kill_on_drop)", child.id()));
     let (stream, _) = listener.accept().await.unwrap();
     let peer = Connection::connect(
         stream.into_std().unwrap(),
@@ -362,6 +363,7 @@ mod websocket {
             .kill_on_drop(true)
             .spawn()
             .unwrap();
+        rutis_bridge::runtime::kill_debug(&format!("SPAWNED test-code node pid {:?} (kill_on_drop)", child.id()));
         let channel = tokio::task::spawn_blocking(move || {
             accepted.recv_timeout(std::time::Duration::from_secs(10))
         })
@@ -391,6 +393,7 @@ mod websocket {
             .kill_on_drop(true)
             .spawn()
             .unwrap();
+        rutis_bridge::runtime::kill_debug(&format!("SPAWNED test-code node pid {:?} (kill_on_drop)", child.id()));
         let mut lines = tokio::io::BufReader::new(child.stderr.take().unwrap()).lines();
         let address = loop {
             let line = lines

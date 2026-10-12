@@ -368,7 +368,7 @@ pub(crate) fn node_inherits(package: &Path) -> bool {
 }
 
 /// TEMPORARY (#287 debug): append a line with a backtrace to /tmp/rutis-kill-debug.log.
-pub(crate) fn kill_debug(what: &str) {
+pub fn kill_debug(what: &str) {
     use std::io::Write;
     let bt = std::backtrace::Backtrace::force_capture();
     let thread = std::thread::current();
@@ -402,6 +402,7 @@ impl Child {
         let (report, exit) = watch::channel(None);
         let ended = Arc::new((Mutex::new(None), Condvar::new()));
         let debug_pid = child.id();
+        kill_debug(&format!("SPAWNED launch node pid {:?}", debug_pid));
         if let Some(pid) = child.id() {
             let record = ended.clone();
             let _ = std::thread::Builder::new()

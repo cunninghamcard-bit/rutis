@@ -21,6 +21,8 @@ mod process;
 mod projection;
 mod rows;
 pub(crate) mod spawn;
+#[doc(hidden)]
+pub use spawn::kill_debug;
 #[cfg(feature = "testing")]
 pub mod testing;
 #[cfg(unix)]
