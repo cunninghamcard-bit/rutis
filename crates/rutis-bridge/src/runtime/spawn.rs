@@ -105,31 +105,35 @@ async fn loopback(mut command: tokio::process::Command, first: &Path) -> Result<
     })
 }
 
-/// Ends the channel, however it ends, with the error `disconnected` builds.
+/// Ends the channel, however it ends, with the error `disconnected` builds
+/// from how the channel itself ended.
 struct Disconnected {
     receiver: Box<dyn Receiver>,
-    disconnected: Option<Box<dyn FnOnce() -> Error + Send>>,
+    disconnected: Option<Box<dyn FnOnce(String) -> Error + Send>>,
 }
 
 impl Receiver for Disconnected {
     fn recv(&mut self) -> Result<Option<Vec<u8>>, ChannelError> {
-        match self.receiver.recv() {
-            Ok(Some(message)) => Ok(Some(message)),
-            _ => Err(ChannelError::Closed {
-                reason: match self.disconnected.take() {
-                    Some(disconnected) => disconnected().to_string(),
-                    None => "peer disconnected".into(),
-                },
-            }),
-        }
+        let ended = match self.receiver.recv() {
+            Ok(Some(message)) => return Ok(Some(message)),
+            Ok(None) => "peer disconnected".to_owned(),
+            Err(error) => error.to_string(),
+        };
+        Err(ChannelError::Closed {
+            reason: match self.disconnected.take() {
+                Some(disconnected) => disconnected(ended).to_string(),
+                None => "peer disconnected".into(),
+            },
+        })
     }
 }
 
 /// Replace how the channel reports its end: `disconnected` runs on the
-/// reader thread once the far end is gone, and may block.
+/// reader thread once the far end is gone, with how the channel ended
+/// (`peer disconnected`, or the receiver's error), and may block.
 pub(crate) fn on_disconnect(
     mut channel: Channel,
-    disconnected: Box<dyn FnOnce() -> Error + Send>,
+    disconnected: Box<dyn FnOnce(String) -> Error + Send>,
 ) -> Channel {
     channel.receiver = Box::new(Disconnected {
         receiver: channel.receiver,
@@ -149,7 +153,7 @@ pub(crate) fn on_disconnect(
 /// refuses, fail at once here instead of waiting for the process.
 struct ExitSender {
     sender: Box<dyn Sender>,
-    ended: Arc<(Mutex<Option<String>>, Condvar)>,
+    ended: Arc<Ended>,
     closed: Arc<AtomicBool>,
 }
 
@@ -163,7 +167,7 @@ impl Sender for ExitSender {
             }
             // Closed here, before or while waiting: the session ends for
             // that.
-            match ended_unless(&self.ended, HANG_GUARD, || {
+            match ended_unless(&self.ended, HANG_GUARD, &error.to_string(), || {
                 self.closed.load(Ordering::SeqCst)
             }) {
                 Some(ended) => ChannelError::Closed {
@@ -179,7 +183,7 @@ impl Sender for ExitSender {
 /// send that waits for the process.
 struct ClosedHere {
     closer: Arc<dyn Closer>,
-    ended: Arc<(Mutex<Option<String>>, Condvar)>,
+    ended: Arc<Ended>,
     closed: Arc<AtomicBool>,
 }
 
@@ -349,42 +353,81 @@ pub(crate) fn node_inherits(package: &Path) -> bool {
     matches!(channels, Some(serde_json::Value::Array(channels)) if channels.iter().any(|c| c == "fd"))
 }
 
+/// How the process ended, once it has, and why this side killed it, if it
+/// did: shared by the exit watcher, the async task that owns the process,
+/// and the reader thread, which must not depend on the runtime (a
+/// current-thread runtime may be blocked in a synchronous call).
+#[derive(Default)]
+struct Ending {
+    status: Option<String>,
+    /// Set before this side kills the process (#287): its end is then this
+    /// side's doing, and says nothing of why the session ended.
+    killed: Option<&'static str>,
+}
+
+type Ended = (Mutex<Ending>, Condvar);
+
 /// The Node process, owned by a task that records how it ended. Dropping
 /// `_kill` ends the process.
 pub(crate) struct Child {
     exit: watch::Receiver<Option<String>>,
-    /// The same status for the reader thread, which must not depend on the
-    /// runtime: a current-thread runtime may be blocked in a synchronous call.
-    ended: Arc<(Mutex<Option<String>>, Condvar)>,
+    ended: Arc<Ended>,
     _kill: oneshot::Sender<()>,
 }
 
+/// The process as the task that waits for it holds it. Dropped before it
+/// was waited for (the runtime shut down with the task), tokio kills it;
+/// this notes first that the kill is this side's.
+struct Watched {
+    child: tokio::process::Child,
+    ended: Arc<Ended>,
+    waited: bool,
+}
+
+impl Drop for Watched {
+    fn drop(&mut self) {
+        if !self.waited {
+            killing(&self.ended, "the async runtime watching it shut down");
+        }
+    }
+}
+
+/// Note that this side is about to kill the process, and why.
+fn killing(ended: &Ended, why: &'static str) {
+    ended.0.lock().unwrap().killed.get_or_insert(why);
+}
+
 impl Child {
-    pub(crate) fn watch(mut child: tokio::process::Child) -> Self {
+    pub(crate) fn watch(child: tokio::process::Child) -> Self {
         let (kill, killed) = oneshot::channel::<()>();
         let (report, exit) = watch::channel(None);
-        let ended = Arc::new((Mutex::new(None), Condvar::new()));
+        let ended = Arc::new(Ended::default());
         if let Some(pid) = child.id() {
             let record = ended.clone();
             let _ = std::thread::Builder::new()
                 .name("rutis-exit".into())
                 .spawn(move || {
                     if let Some(status) = peek_exit(pid) {
-                        record_exit(&record, describe(Ok(status)));
+                        record_exit(&record, Ok(status));
                     }
                 });
         }
-        let record = ended.clone();
+        let mut watched = Watched {
+            child,
+            ended: ended.clone(),
+            waited: false,
+        };
         tokio::spawn(async move {
             let status = tokio::select! {
-                status = child.wait() => status,
+                status = watched.child.wait() => status,
                 _ = killed => {
-                    let _ = child.start_kill();
-                    child.wait().await
+                    killing(&watched.ended, "its handle was dropped");
+                    let _ = watched.child.start_kill();
+                    watched.child.wait().await
                 }
             };
-            let status = describe(status);
-            record_exit(&record, status.clone());
+            watched.waited = true;
+            let status = record_exit(&watched.ended, status);
             report.send_replace(Some(status));
         });
         Self {
@@ -398,7 +441,7 @@ impl Child {
     /// watcher or the runtime records it, so it agrees with the error that
     /// ended the session.
     pub(crate) fn status(&self) -> Option<String> {
-        self.ended.0.lock().unwrap().clone()
+        self.ended.0.lock().unwrap().status.clone()
     }
 
     pub(crate) async fn exited(&self) -> String {
@@ -407,11 +450,11 @@ impl Child {
         status.map_or_else(|_| "is gone".to_owned(), |status| status.clone().unwrap())
     }
 
-    /// The error that ends a session whose peer went away: waits for the
-    /// process to end so the error can say how.
-    pub(crate) fn disconnected(&self) -> impl FnOnce() -> Error + Send {
+    /// The error that ends a session whose peer went away, given how the
+    /// channel ended: waits for the process to end so the error can say how.
+    pub(crate) fn disconnected(&self) -> impl FnOnce(String) -> Error + Send {
         let ended = self.ended.clone();
-        move || ended_with(&ended, HANG_GUARD)
+        move |channel| ended_with(&ended, HANG_GUARD, &channel)
     }
 }
 
@@ -424,48 +467,54 @@ impl Child {
 const HANG_GUARD: Duration = Duration::from_secs(10);
 
 /// Waits for the process to end, as `ended` records it, and says how; a
-/// process still running after `guard` is reported as such.
-fn ended_with(ended: &(Mutex<Option<String>>, Condvar), guard: Duration) -> Error {
-    ended_unless(ended, guard, || false).expect("not stopped")
+/// process still running after `guard` is reported as such. `channel` says
+/// how the channel ended (or a send failed), which is the error when this
+/// side killed the process: that end is not why the session ended (#287).
+fn ended_with(ended: &Ended, guard: Duration, channel: &str) -> Error {
+    ended_unless(ended, guard, channel, || false).expect("not stopped")
 }
 
 /// [`ended_with`], or `None` as soon as `stop` holds instead: checked under
 /// `ended`'s lock, so whoever makes it hold sets it under that lock and
 /// notifies.
 fn ended_unless(
-    ended: &(Mutex<Option<String>>, Condvar),
+    ended: &Ended,
     guard: Duration,
+    channel: &str,
     stop: impl Fn() -> bool,
 ) -> Option<Error> {
-    let (status, changed) = ended;
-    let (status, _) = changed
-        .wait_timeout_while(status.lock().unwrap(), guard, |status| {
-            status.is_none() && !stop()
+    let (ending, changed) = ended;
+    let (ending, _) = changed
+        .wait_timeout_while(ending.lock().unwrap(), guard, |ending| {
+            ending.status.is_none() && !stop()
         })
         .unwrap();
-    if status.is_none() && stop() {
+    if ending.status.is_none() && stop() {
         return None;
     }
-    Some(Error::Transport(match status.clone() {
-        Some(status) => format!("Cordis process {status}"),
-        None => format!(
+    Some(Error::Transport(match (&ending.status, ending.killed) {
+        (Some(status), None) => format!("Cordis process {status}"),
+        (Some(_), Some(why)) => {
+            format!("{channel} (Cordis process then killed by this side: {why})")
+        }
+        (None, _) => format!(
             "Cordis process closed its channel but has not exited after {}s",
             guard.as_secs_f32()
         ),
     }))
 }
 
-fn describe(status: std::io::Result<std::process::ExitStatus>) -> String {
-    match status {
+/// Record how the process ended, unless it was already (the exit watcher
+/// and the task both see it), and return what is recorded.
+fn record_exit(ended: &Ended, status: std::io::Result<std::process::ExitStatus>) -> String {
+    let status = match status {
         Ok(status) if status.success() => "exited normally".to_owned(),
         Ok(status) => format!("exited with {status}"),
         Err(error) => format!("cannot be waited for: {error}"),
-    }
-}
-
-fn record_exit(ended: &(Mutex<Option<String>>, Condvar), status: String) {
-    ended.0.lock().unwrap().get_or_insert(status);
+    };
+    let recorded = ended.0.lock().unwrap().status.get_or_insert(status).clone();
     ended.1.notify_all();
+    recorded
 }
 
 /// Waits until the process `pid` ends and reports its status, independently
@@ -720,6 +769,42 @@ mod tests {
         child.exited().await;
     }
 
+    /// #287: a process this side kills (its handle dropped, say on a failed
+    /// launch) does not end the channel with its exit status, `signal: 9`,
+    /// as if it had died by itself: the channel ends with how it ended, and
+    /// says that this side killed the process.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_process_killed_here_is_not_reported_as_its_own_end() {
+        let directory = tempfile::tempdir().unwrap();
+        let gate = fifo(directory.path());
+        let Spawned { channel, child, .. } =
+            inherit(closes_then_waits(&gate), Path::new("first")).unwrap();
+        let Channel {
+            sender,
+            mut receiver,
+            ..
+        } = channel;
+        let (received, receive) = mpsc::channel();
+        std::thread::spawn(move || received.send(receiver.recv()).unwrap());
+        let send = send_until_it_fails(sender);
+        // clock: weak-negative — as above; the end after the kill is the
+        // positive half.
+        assert!(
+            receive.recv_timeout(Duration::from_millis(500)).is_err(),
+            "the channel ended before the process did"
+        );
+
+        drop(child);
+        let ChannelError::Closed { reason } = receive.recv_timeout(SETTLED).unwrap().unwrap_err();
+        assert_eq!(
+            reason,
+            "peer disconnected (Cordis process then killed by this side: its handle was dropped)"
+        );
+        let failed = send.recv_timeout(SETTLED).unwrap().unwrap_err();
+        assert!(!failed.to_string().contains("signal"), "{failed}");
+        assert!(failed.to_string().contains("killed by this side"), "{failed}");
+    }
+
     /// A process that closed its channel and does not exit ends the session
     /// once the guard runs out, saying so rather than `peer disconnected`.
     #[tokio::test(flavor = "multi_thread")]
@@ -729,7 +814,7 @@ mod tests {
         let Spawned { child, .. } = inherit(closes_then_waits(&gate), Path::new("first")).unwrap();
         let ended = child.ended.clone();
         let error =
-            tokio::task::spawn_blocking(move || ended_with(&ended, Duration::from_millis(100)))
+            tokio::task::spawn_blocking(move || ended_with(&ended, Duration::from_millis(100), "peer disconnected"))
                 .await
                 .unwrap();
         assert_eq!(

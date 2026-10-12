@@ -61,7 +61,10 @@ impl Connection {
         disconnected: Box<dyn FnOnce() -> Error + Send>,
     ) -> Result<Self, Error> {
         Self::open(
-            crate::runtime::spawn::on_disconnect(channel(stream, "")?, disconnected),
+            crate::runtime::spawn::on_disconnect(
+                channel(stream, "")?,
+                Box::new(move |_| disconnected()),
+            ),
             dispatch,
         )
     }
