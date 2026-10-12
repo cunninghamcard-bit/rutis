@@ -380,6 +380,7 @@ async fn loopback(spawn: &Spawn, token_wait: Duration) -> Result<Started, Connec
         .map_err(|error| cannot_start(spawn, error))?;
     // A process that would outlive its host is not started.
     if let Err(reason) = adopt(&child) {
+        crate::runtime::spawn::kill_debug("transport::local adopt failed: start_kill");
         let _ = child.start_kill();
         return Err(ConnectError::Incompatible {
             reason: format!(
@@ -714,11 +715,13 @@ fn kill_now(child: &mut tokio::process::Child) {
         // its group's can have been reused.
         unsafe {
             if libc::getpgid(pid) == pid {
+                crate::runtime::spawn::kill_debug(&format!("transport::local kill_now: kill(-{pid})"));
                 libc::kill(-pid, libc::SIGKILL);
                 return;
             }
         }
     }
+    crate::runtime::spawn::kill_debug(&format!("transport::local kill_now: start_kill {:?}", child.id()));
     let _ = child.start_kill();
 }
 

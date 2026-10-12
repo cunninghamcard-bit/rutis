@@ -84,6 +84,7 @@ async fn loopback(mut command: tokio::process::Command, first: &Path) -> Result<
         .map_err(transport)?;
     // A process that would outlive its host is not started.
     if let Err(reason) = adopt(&child) {
+        kill_debug("runtime::spawn loopback adopt failed: start_kill");
         let _ = child.start_kill();
         return Err(Error::Transport(format!(
             "cannot tie the runtime process to this process's lifetime: {reason}"
@@ -366,6 +367,16 @@ pub(crate) fn node_inherits(package: &Path) -> bool {
     matches!(channels, Some(serde_json::Value::Array(channels)) if channels.iter().any(|c| c == "fd"))
 }
 
+/// TEMPORARY (#287 debug): append a line with a backtrace to /tmp/rutis-kill-debug.log.
+pub(crate) fn kill_debug(what: &str) {
+    use std::io::Write;
+    let bt = std::backtrace::Backtrace::force_capture();
+    let thread = std::thread::current();
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/rutis-kill-debug.log") {
+        let _ = writeln!(f, "==== {} process={} thread={:?}\n{}\n{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0), std::process::id(), thread.name(), what, bt);
+    }
+}
+
 /// The Node process, owned by a task that records how it ended. Dropping
 /// `_kill` ends the process.
 pub(crate) struct Child {
@@ -374,6 +385,15 @@ pub(crate) struct Child {
     /// runtime: a current-thread runtime may be blocked in a synchronous call.
     ended: Arc<(Mutex<Option<String>>, Condvar)>,
     _kill: oneshot::Sender<()>,
+    debug_pid: Option<u32>,
+}
+
+impl Drop for Child {
+    fn drop(&mut self) {
+        if self.ended.0.lock().unwrap().is_none() {
+            kill_debug(&format!("runtime::spawn::Child dropped while pid {:?} still runs (will SIGKILL)", self.debug_pid));
+        }
+    }
 }
 
 impl Child {
@@ -381,6 +401,7 @@ impl Child {
         let (kill, killed) = oneshot::channel::<()>();
         let (report, exit) = watch::channel(None);
         let ended = Arc::new((Mutex::new(None), Condvar::new()));
+        let debug_pid = child.id();
         if let Some(pid) = child.id() {
             let record = ended.clone();
             let _ = std::thread::Builder::new()
@@ -392,14 +413,25 @@ impl Child {
                 });
         }
         let record = ended.clone();
+        struct TaskGuard(Option<u32>, bool);
+        impl Drop for TaskGuard {
+            fn drop(&mut self) {
+                if !self.1 {
+                    kill_debug(&format!("runtime::spawn::Child watch task dropped before the process {:?} ended (kill_on_drop SIGKILL)", self.0));
+                }
+            }
+        }
         tokio::spawn(async move {
+            let mut guard = TaskGuard(debug_pid, false);
             let status = tokio::select! {
                 status = child.wait() => status,
                 _ = killed => {
+                    kill_debug(&format!("runtime::spawn::Child killed branch: start_kill pid {:?}", debug_pid));
                     let _ = child.start_kill();
                     child.wait().await
                 }
             };
+            guard.1 = true;
             let status = describe(status);
             record_exit(&record, status.clone());
             report.send_replace(Some(status));
@@ -408,6 +440,7 @@ impl Child {
             exit,
             ended,
             _kill: kill,
+            debug_pid,
         }
     }
 
